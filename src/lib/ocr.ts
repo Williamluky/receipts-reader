@@ -6,6 +6,42 @@ export type OcrProgress = {
   message?: string;
 };
 
+type TesseractWorkerV2 = {
+  load: () => Promise<void>;
+  loadLanguage: (lang: string) => Promise<void>;
+  initialize: (lang: string) => Promise<void>;
+  recognize: (image: Blob) => Promise<{ data: { text: string } }>;
+  terminate: () => Promise<void>;
+};
+
+type PdfViewport = { width: number; height: number };
+type PdfPage = {
+  getViewport: (opts: { scale: number }) => PdfViewport;
+  render: (params: { canvasContext: CanvasRenderingContext2D; viewport: PdfViewport }) => { promise: Promise<void> };
+};
+type PdfDocument = { numPages: number; getPage: (pageNum: number) => Promise<PdfPage> };
+type PdfjsLib = {
+  GlobalWorkerOptions: { workerSrc: string };
+  getDocument: (params: { data: ArrayBuffer }) => { promise: Promise<PdfDocument> };
+};
+
+async function ensurePdfJs(onProgress?: (p: OcrProgress) => void): Promise<PdfjsLib | null> {
+  if (typeof window === "undefined") return null;
+  if ((window as unknown as { pdfjsLib?: PdfjsLib }).pdfjsLib) return (window as unknown as { pdfjsLib: PdfjsLib }).pdfjsLib;
+  onProgress?.({ stage: "loading", percent: 0, message: "Loading PDF engine" });
+  await new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load PDF.js"));
+    document.head.appendChild(script);
+  });
+  const pdfjsLib = (window as unknown as { pdfjsLib: PdfjsLib }).pdfjsLib;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  return pdfjsLib;
+}
+
 async function extractTextFromImageBlob(imageBlob: Blob, onProgress?: (p: OcrProgress) => void): Promise<string> {
   const { createWorker } = await import("tesseract.js");
   onProgress?.({ stage: "loading", percent: 0, message: "Loading OCR engine" });
@@ -27,29 +63,23 @@ async function extractTextFromImageBlob(imageBlob: Blob, onProgress?: (p: OcrPro
   });
   try {
     // v2 requires an explicit load before language init
-    // @ts-ignore v2 worker API
-    await worker.load();
-    // @ts-ignore v2 worker API
-    await worker.loadLanguage("eng");
-    // @ts-ignore v2 worker API
-    await worker.initialize("eng");
+    const w = worker as unknown as TesseractWorkerV2;
+    await w.load();
+    await w.loadLanguage("eng");
+    await w.initialize("eng");
     onProgress?.({ stage: "recognizing", percent: 0, message: "Recognizing image" });
-    // @ts-ignore v2 worker API
-    const { data } = await worker.recognize(imageBlob);
+    const { data } = await w.recognize(imageBlob);
     return data.text || "";
   } finally {
-    // @ts-ignore v2 worker API
-    await worker.terminate();
+    const w = worker as unknown as TesseractWorkerV2;
+    await w.terminate();
     onProgress?.({ stage: "done", percent: 100 });
   }
 }
 
 async function renderPdfToImages(file: File, onProgress?: (p: OcrProgress) => void): Promise<Blob[]> {
   onProgress?.({ stage: "loading", percent: 0, message: "Loading PDF" });
-  const pdfjsLib = await import("pdfjs-dist");
-  // Use CDN worker to avoid bundling complexity
-  (pdfjsLib as unknown as { GlobalWorkerOptions: { workerSrc: string } }).GlobalWorkerOptions.workerSrc =
-    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const pdfjsLib = (await ensurePdfJs(onProgress)) as PdfjsLib;
 
   const arrayBuffer = await file.arrayBuffer();
   const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
